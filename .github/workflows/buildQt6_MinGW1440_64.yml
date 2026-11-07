@@ -1,0 +1,182 @@
+name: build_Qt6.8_MinGW1440_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: 'latest = 自动取 6.8 LTS 最新 patch；也可填 6.8.x 复现指定版本'
+        required: false
+        default: 'latest'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_qt:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      FILE_NAME: static-Release_mingw1440_64_UCRT
+      QT_ROOT: D:\a\QtBuild
+
+    steps:
+    # 检出本仓库
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    # 解析 Qt 版本：从 Qt 归档目录页取最大 6.8.x，或按手动指定的版本
+    - name: Resolve Qt version
+      id: resolve
+      shell: pwsh
+      env:
+        REQUESTED: ${{ inputs.qt_version }}
+      run: |
+        $requested = if ($env:REQUESTED) { $env:REQUESTED.Trim() } else { 'latest' }
+        if ($requested -eq 'latest') {
+          $index = Join-Path $env:TEMP 'qt-6.8-index.html'
+          curl.exe -L -f --retry 3 -sS -o $index https://download.qt.io/archive/qt/6.8/ 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $index)) { throw "无法获取 Qt 6.8 版本目录" }
+          $found = [regex]::Matches((Get-Content $index -Raw), '6\.8\.\d+') |
+            ForEach-Object { $_.Value } | Sort-Object -Unique
+          if (-not $found) { throw "Qt 6.8 目录页中未解析到任何 6.8.x 版本" }
+          $ver = $found | Sort-Object { [version]$_ } | Select-Object -Last 1
+          Remove-Item $index -Force -ErrorAction SilentlyContinue
+        } elseif ($requested -match '^6\.8\.\d+$') {
+          $ver = $requested
+        } else {
+          throw "版本号不合法: $requested（应为 latest 或 6.8.x）"
+        }
+        # 6.8.4 起 single 包统一命名为 qt-everywhere-opensource-src-<版本>.zip
+        if ([version]$ver -lt [version]'6.8.4') { throw "版本 $ver 过旧，需 6.8.4 及以上" }
+        Write-Host "Qt version: $ver (requested: $requested)"
+        "qt_version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    # Qt6 configure 依赖 Python
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.13'
+        architecture: 'x64'
+
+    # 安装 Ninja
+    - name: Setup Ninja
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "$env:QT_ROOT\ninja" | Out-Null
+        curl.exe -L -f --retry 3 -o ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip
+        unzip -q -o ninja.zip -d "$env:QT_ROOT\ninja"
+
+    # 安装 MinGW-lite 14.4.0 UCRT(64-ucrt 档：ucrt + posix + seh)
+    - name: Setup MinGW 14.4.0
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path $env:QT_ROOT | Out-Null
+        $pkg = "$env:QT_ROOT\mingw64-ucrt-14.4.0-r1.1.7z"
+        $url = 'https://github.com/xccfcpd/mingw-lite/releases/download/14.4-v1.1/mingw64-ucrt-14.4.0-r1.1.7z'
+        curl.exe -L -f --retry 3 -o $pkg $url
+        $hash = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne '057e2248c5758a58d3699e8d3e516c21447500c8931693cbb7f6a481b6f0ed17') {
+          throw "MinGW 包 SHA256 不匹配: $hash"
+        }
+        $tools = "$env:QT_ROOT\Tools\mingw1440_64"
+        7z x $pkg "-o$tools" -y | Out-Null
+
+        # 不假设 7z 包内层级，递归定位 gcc.exe 所在 bin 目录
+        $gcc = Get-ChildItem -Path $tools -Filter gcc.exe -Recurse -File | Select-Object -First 1
+        if (-not $gcc) { throw "在 $tools 下找不到 gcc.exe" }
+        $bin = $gcc.DirectoryName
+        "MINGW_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & (Join-Path $bin 'gcc.exe') --version
+        & (Join-Path $bin 'g++.exe') --version
+
+    # 下载源码、校验 SHA256、编译
+    - name: Build Qt
+      shell: pwsh
+      env:
+        QT_VERSION: ${{ steps.resolve.outputs.qt_version }}
+      run: |
+        New-Item -ItemType Directory -Force -Path $env:QT_ROOT | Out-Null
+        $ver = $env:QT_VERSION
+        $srcRoot = "$env:QT_ROOT\Qt\$ver"
+        New-Item -ItemType Directory -Force -Path $srcRoot, "$env:QT_ROOT\Qt\$ver-static" | Out-Null
+
+        $base = "https://download.qt.io/archive/qt/6.8/$ver/single"
+        $srcName = "qt-everywhere-opensource-src-$ver.zip"
+        $zip = "$env:QT_ROOT\qt-everywhere-src.zip"
+        curl.exe -L -f --retry 3 -sS -o $zip "$base/$srcName" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $zip) -or (Get-Item $zip).Length -lt 100MB) {
+          throw "Qt 源码包下载失败: $base/$srcName"
+        }
+        Write-Host "downloaded: $srcName $([math]::Round((Get-Item $zip).Length / 1MB)) MB"
+
+        # 版本不固定，必须以 Qt 官方同名 .sha256 为唯一校验依据，取不到直接失败
+        $shaFile = "$env:QT_ROOT\qt-everywhere-src.zip.sha256"
+        curl.exe -L -f --retry 3 -sS -o $shaFile "$base/$srcName.sha256" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $shaFile)) {
+          throw "缺少 Qt 官方 SHA256 校验文件: $base/$srcName.sha256"
+        }
+        $parts = ((Get-Content $shaFile -Raw).Trim() -split '\s+')
+        $expected = $parts[0].ToLower()
+        if ($expected -notmatch '^[0-9a-f]{64}$') { throw "Qt 官方 .sha256 格式异常: $expected" }
+        if ($parts.Count -gt 1 -and $parts[1] -ne $srcName) {
+          throw "Qt 官方 .sha256 对应的文件名与 $srcName 不一致: $($parts[1])"
+        }
+        Write-Host "Qt 官方 .sha256: $expected"
+
+        $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+        Write-Host "actual SHA256   : $actual"
+        if ($actual -ne $expected) { throw "Qt 源码包 SHA256 校验失败：实际 $actual，期望 $expected" }
+        Write-Host "Qt 源码包 SHA256 校验通过"
+
+        unzip -q -o $zip -d $srcRoot
+
+        # 动态探测解压后的源码顶层目录，交给 cmd
+        $src = Get-ChildItem -Directory -Path $srcRoot |
+          Where-Object { $_.Name -like 'qt-everywhere*' } | Select-Object -First 1
+        if (-not $src) { throw "解压后未找到 qt-everywhere* 源码目录" }
+        $env:QT_SRC_DIR = $src.Name
+        Write-Host "source dir: $($src.FullName)"
+
+        cmd.exe /c "call `"$env:GITHUB_WORKSPACE\buildQt6\build-Qt6mingw1440_64.cmd`""
+        if ($LASTEXITCODE -ne 0) { throw "Qt 编译失败，退出码 $LASTEXITCODE" }
+
+    # 打包
+    - name: Package binaries
+      shell: pwsh
+      env:
+        QT_VERSION: ${{ steps.resolve.outputs.qt_version }}
+      run: |
+        $artifact = "Qt_$env:QT_VERSION-$env:FILE_NAME.7z"
+        $install = "$env:QT_ROOT\Qt\$env:QT_VERSION-static\mingw1440_64_UCRT"
+        if (-not (Test-Path "$install\bin\moc.exe") -or -not (Test-Path "$install\lib\cmake\Qt6\Qt6Config.cmake")) {
+          throw "安装目录缺少 moc.exe 或 Qt6Config.cmake，编译可能未成功"
+        }
+        7z a $artifact $install -mx=9
+        (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLower() + "  $artifact" |
+          Out-File -FilePath "$artifact.sha256" -Encoding utf8
+
+    # 上传产物（GitHub 默认保留 90 天）
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}
+        path: |
+          Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}.7z
+          Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}.7z.sha256
+
+    # 发布到 GitHub Release
+    - name: Publish GitHub Release
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}
+        name: Qt ${{ steps.resolve.outputs.qt_version }} static MinGW 14.4.0 UCRT
+        body: |
+          Qt ${{ steps.resolve.outputs.qt_version }} 静态 Release 版本，Windows x86_64
+          编译器：mingw-lite 14.4.0-r1.1（64-ucrt，posix/seh，UCRT）
+          源码：https://download.qt.io/archive/qt/6.8/${{ steps.resolve.outputs.qt_version }}/
+          源码包 SHA256 已按 Qt 官方 .sha256 校验
+        files: |
+          Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}.7z
+          Qt_${{ steps.resolve.outputs.qt_version }}-${{ env.FILE_NAME }}.7z.sha256
